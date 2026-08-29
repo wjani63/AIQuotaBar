@@ -2,7 +2,6 @@
 
 import json
 import os
-import subprocess
 from datetime import datetime, timezone
 
 from aiquotabar.config import log, WIDGET_HOST_APP, WIDGET_CACHE_DIR, WIDGET_CACHE_FILE
@@ -118,12 +117,8 @@ def _write_widget_cache(
             json.dump(payload, f, indent=2)
         os.replace(tmp, WIDGET_CACHE_FILE)
         log.debug("widget cache written: %s", WIDGET_CACHE_FILE)
-
-        # Nudge WidgetKit to reload (non-blocking, best-effort)
-        subprocess.Popen(
-            ["open", "-g", "-a", "AIQuotaBarHost", "--args", "--reload-widget"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        # Do not launch AIQuotaBarHost — opening it shows a visible window every refresh.
+        # WidgetKit reads usage.json on its own timeline; menu bar mode needs no host app.
     except Exception:
         log.debug("_write_widget_cache failed", exc_info=True)
 
@@ -131,3 +126,19 @@ def _write_widget_cache(
 def _is_widget_installed() -> bool:
     """Check if the AIQuotaBarHost widget app is installed."""
     return os.path.isdir(WIDGET_HOST_APP)
+
+
+def _dismiss_widget_host() -> None:
+    """Close AIQuotaBarHost if running — menu-bar-only mode must not show its window."""
+    if not _is_widget_installed():
+        return
+    try:
+        import subprocess
+        subprocess.run(
+            ["osascript", "-e", 'tell application "AIQuotaBarHost" to quit'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        log.debug("_dismiss_widget_host failed", exc_info=True)

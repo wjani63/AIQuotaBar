@@ -238,6 +238,38 @@ _CHATGPT_HEADERS = {
     "Referer": "https://chatgpt.com/codex/settings/usage",
 }
 
+# Saved in config when ChatGPT is authenticated via Codex CLI (~/.codex/auth.json).
+CHATGPT_CODEX_AUTH_MARKER = "__codex_auth__"
+_CODEX_AUTH_PATH = os.path.expanduser("~/.codex/auth.json")
+
+
+def _load_codex_auth_tokens() -> tuple[str, str | None] | None:
+    """Read access_token (+ optional account_id) from Codex CLI auth file."""
+    if not os.path.isfile(_CODEX_AUTH_PATH):
+        return None
+    try:
+        with open(_CODEX_AUTH_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            return None
+        access = tokens.get("access_token")
+        if not access or not str(access).strip():
+            return None
+        account_id = tokens.get("account_id")
+        aid = str(account_id).strip() if account_id is not None else None
+        return str(access).strip(), aid or None
+    except Exception as e:
+        log.debug("_load_codex_auth_tokens failed: %s", e)
+        return None
+
+
+def _chatgpt_wham_request_headers(token: str, account_id: str | None = None) -> dict:
+    h = {**_CHATGPT_HEADERS, "Authorization": f"Bearer {token}"}
+    if account_id:
+        h["ChatGPT-Account-Id"] = account_id
+    return h
+
 
 def _chatgpt_access_token(cookies: dict) -> str | None:
     """Exchange session cookie for a short-lived Bearer token."""
@@ -295,12 +327,35 @@ def _parse_wham_usage(data: dict) -> ProviderData:
 
 def fetch_chatgpt(cookie_str: str) -> ProviderData:
     """Fetch ChatGPT / Codex usage via /backend-api/wham/usage."""
-    cookies = parse_cookie_string(cookie_str)
     try:
-        token = _chatgpt_access_token(cookies)
+        token: str | None = None
+        account_id: str | None = None
+        cookies: dict | None = None
+
+        use_codex_only = cookie_str == CHATGPT_CODEX_AUTH_MARKER
+        if cookie_str and not use_codex_only:
+            cookies = parse_cookie_string(cookie_str)
+            try:
+                token = _chatgpt_access_token(cookies)
+            except Exception as e:
+                log.debug("chatgpt browser session rejected: %s", e)
+                token = None
+
+        if not token:
+            loaded = _load_codex_auth_tokens()
+            if loaded:
+                token, account_id = loaded
+                cookies = None
+                log.info(
+                    "ChatGPT: using ~/.codex/auth.json token (browser session stale)"
+                )
+            elif use_codex_only:
+                return ProviderData("ChatGPT", error="Codex auth.json missing or empty")
+
         if not token:
             return ProviderData("ChatGPT", error="Not logged in")
-        h = {**_CHATGPT_HEADERS, "Authorization": f"Bearer {token}"}
+
+        h = _chatgpt_wham_request_headers(token, account_id)
         data = _api_get("https://chatgpt.com/backend-api/wham/usage", h, cookies)
         return _parse_wham_usage(data)
     except Exception as e:
@@ -541,9 +596,14 @@ try:
         try:
             jar = fn(domain_name=domain)
             cookies = {x.name: x for x in jar}
-            if target not in cookies:
+            if target in cookies:
+                expiry_key = target
+            elif target + '.0' in cookies:
+                # NextAuth splits large JWTs into target.0, target.1, ...
+                expiry_key = target + '.0'
+            else:
                 continue
-            expires = cookies[target].expires or 0
+            expires = cookies[expiry_key].expires or 0
             # Normalize expiry to seconds. Firefox can report the value in
             # milliseconds (or an overflowed scale), which made a stale
             # session always out-rank a valid Chromium one. Anything past
@@ -593,6 +653,18 @@ def _run_cookie_detection(domain: str, target_cookie: str) -> list[str]:
     return []
 
 
+def _chatgpt_cookie_is_valid(cookie_str: str) -> bool:
+    """True if this cookie jar yields a ChatGPT access token."""
+    if cookie_str == CHATGPT_CODEX_AUTH_MARKER:
+        return bool(_load_codex_auth_tokens())
+    try:
+        token = _chatgpt_access_token(parse_cookie_string(cookie_str))
+        return bool(token)
+    except Exception as e:
+        log.debug("chatgpt cookie candidate rejected: %s", e)
+        return False
+
+
 def _claude_cookie_is_valid(cookie_str: str) -> bool:
     """True if this cookie string authenticates against claude.ai.
 
@@ -634,11 +706,18 @@ def _auto_detect_cookies() -> str | None:
 
 
 def _auto_detect_chatgpt_cookies() -> str | None:
-    """Detect chatgpt.com session cookies from the browser (crash-safe subprocess)."""
-    if not _BROWSER_COOKIE3_OK:
-        return None
-    cands = _run_cookie_detection("chatgpt.com", "__Secure-next-auth.session-token")
-    return cands[0] if cands else None
+    """Detect ChatGPT auth: browser cookies first, else Codex CLI ~/.codex/auth.json."""
+    if _BROWSER_COOKIE3_OK:
+        cands = _run_cookie_detection("chatgpt.com", "__Secure-next-auth.session-token")
+        for cookie_str in cands:
+            if _chatgpt_cookie_is_valid(cookie_str):
+                return cookie_str
+        if cands:
+            log.debug("no chatgpt cookie candidate validated; using best-ranked")
+            return cands[0]
+    if _load_codex_auth_tokens():
+        return CHATGPT_CODEX_AUTH_MARKER
+    return None
 
 
 def _auto_detect_copilot_cookies() -> str | None:

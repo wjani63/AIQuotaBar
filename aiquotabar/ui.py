@@ -836,11 +836,22 @@ def _finalize_popup_menu(ns_menu) -> None:
         ns_menu.setAutoenablesItems_(False)
     except Exception:
         pass
-    try:
-        for item in ns_menu.itemArray() or []:
-            item.setEnabled_(True)
-    except Exception:
-        pass
+
+    def _enable_tree(menu):
+        try:
+            for item in menu.itemArray() or []:
+                item.setEnabled_(True)
+                sub = item.submenu()
+                if sub is not None:
+                    try:
+                        sub.setAutoenablesItems_(False)
+                    except Exception:
+                        pass
+                    _enable_tree(sub)
+        except Exception:
+            pass
+
+    _enable_tree(ns_menu)
 
 
 def _mi(title: str) -> rumps.MenuItem:
@@ -3004,26 +3015,63 @@ class ClaudeBar(rumps.App):
         url = "https://x.com/intent/post?text=" + urllib.parse.quote(text)
         subprocess.Popen(["open", url])
 
+    def _apply_provider_cookies(self, cfg_key: str, name: str, ck: str):
+        with self._config_lock:
+            self.config[cfg_key] = ck
+            save_config(self.config)
+        _notify("Claude Usage Bar", f"{name} cookies updated \u2713", "Fetching usage\u2026")
+        self._schedule_fetch()
+        self._schedule_deferred_menu_rebuild(self._last_data)
+
+    def _offer_chatgpt_manual_cookie(self):
+        key = _ask_text(
+            title="Claude Usage Bar \u2014 ChatGPT",
+            prompt=(
+                "No ChatGPT browser session was found.\n\n"
+                "If you use the ChatGPT desktop app only, paste cookies from Chrome:\n"
+                "chatgpt.com \u2192 DevTools \u2192 Network \u2192 any request \u2192 "
+                "Copy cookie header (must include __Secure-next-auth.session-token).\n\n"
+                "Leave blank to cancel."
+            ),
+            default=self.config.get("chatgpt_cookies", ""),
+        )
+        if key and key.strip():
+            self._apply_provider_cookies("chatgpt_cookies", "ChatGPT", key.strip())
+
     def _make_provider_key_cb(self, cfg_key: str, name: str):
         def _cb(_sender):
             if cfg_key in COOKIE_PROVIDERS:
-                # Cookie-based: re-run auto-detect
                 _detectors = {
                     "chatgpt_cookies": _auto_detect_chatgpt_cookies,
                     "copilot_cookies": _auto_detect_copilot_cookies,
                     "cursor_cookies":  _auto_detect_cursor_cookies,
                 }
                 detect_fn = _detectors.get(cfg_key)
-                if detect_fn:
-                    ck = detect_fn()
+                if not detect_fn:
+                    return
+
+                def _finish(ck: str | None):
                     if ck:
-                        self.config[cfg_key] = ck
-                        save_config(self.config)
-                        _notify("Claude Usage Bar", f"{name} cookies updated \u2713", "Fetching usage\u2026")
-                        self._schedule_fetch()
-                    else:
-                        _notify("Claude Usage Bar", f"Could not find {name} session",
-                                f"Make sure you are logged into {name} in your browser.")
+                        self._apply_provider_cookies(cfg_key, name, ck)
+                        return
+                    if cfg_key == "chatgpt_cookies":
+                        self._offer_chatgpt_manual_cookie()
+                        return
+                    _notify(
+                        "Claude Usage Bar",
+                        f"Could not find {name} session",
+                        f"Make sure you are logged into {name} in Chrome, Safari, or Firefox.",
+                    )
+
+                def _run_detect():
+                    try:
+                        ck = detect_fn()
+                    except Exception:
+                        log.exception("provider auto-detect failed for %s", cfg_key)
+                        ck = None
+                    rumps.Timer(lambda _t: (_t.stop(), _finish(ck)), 0).start()
+
+                threading.Thread(target=_run_detect, daemon=True).start()
                 return
             # API key-based
             current = self.config.get(cfg_key, "")
@@ -3207,11 +3255,21 @@ class ClaudeBar(rumps.App):
 
     def _paste_cookie(self, _sender):
         text = _clipboard_text()
-        if not text or ("sessionKey" not in text and "=" not in text):
+        if not text or "=" not in text:
             _notify(
                 "Claude Usage Bar",
                 "Nothing useful in clipboard",
                 "Copy your cookie string from Chrome DevTools first.",
+            )
+            return
+        if "__Secure-next-auth.session-token" in text or "next-auth.session-token" in text:
+            self._apply_provider_cookies("chatgpt_cookies", "ChatGPT", text.strip())
+            return
+        if "sessionKey" not in text:
+            _notify(
+                "Claude Usage Bar",
+                "Unrecognized cookie string",
+                "Use Claude sessionKey or ChatGPT __Secure-next-auth.session-token.",
             )
             return
         self.config["cookie_str"] = text
